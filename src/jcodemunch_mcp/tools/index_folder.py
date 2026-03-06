@@ -38,11 +38,16 @@ SKIP_PATTERNS = [
 
 def should_skip_file(path: str) -> bool:
     """Check if file should be skipped based on path patterns."""
-    # Normalize path separators for matching
     normalized = path.replace("\\", "/")
     for pattern in SKIP_PATTERNS:
-        if pattern in normalized:
-            return True
+        if pattern.endswith("/"):
+            # Directory pattern: match only complete path segments to avoid
+            # false positives on names like "rebuild/" or "proto-utils/"
+            if normalized.startswith(pattern) or ("/" + pattern) in normalized:
+                return True
+        else:
+            if pattern in normalized:
+                return True
     return False
 
 
@@ -60,7 +65,7 @@ def _load_gitignore(folder_path: Path) -> Optional[pathspec.PathSpec]:
 
 def discover_local_files(
     folder_path: Path,
-    max_files: int = 500,
+    max_files: int = 10_000,
     max_size: int = DEFAULT_MAX_FILE_SIZE,
     extra_ignore_patterns: Optional[list[str]] = None,
     follow_symlinks: bool = False,
@@ -430,8 +435,8 @@ def index_folder(
         if warnings:
             result["warnings"] = warnings
 
-        if len(source_files) >= 500:
-            result["note"] = "Folder has many files; indexed first 500"
+        if len(source_files) >= 10_000:
+            result["note"] = "Large repository: indexed first 10,000 source files (priority: src/, lib/, pkg/, cmd/, internal/)"
 
         return result
 

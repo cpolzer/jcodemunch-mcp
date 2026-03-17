@@ -92,11 +92,38 @@ def _direct_callers(index, store, owner: str, name: str, sym_file: str) -> list[
     return sorted(callers)
 
 
+def _to_markdown(repo: str, symbol_entries: list[dict], file_imports_cache: dict) -> str:
+    """Render symbol entries as structured markdown."""
+    lines: list[str] = [f"# Context Bundle: {repo}\n"]
+    for e in symbol_entries:
+        lang = e.get("language", "")
+        fence = lang if lang else ""
+        lines.append(f"## `{e['name']}` ({e['kind']}) — `{e['file']}:{e['line']}`\n")
+
+        imports = e.get("imports") or file_imports_cache.get(e["file"], [])
+        if imports:
+            lines.append(f"### Imports\n```{fence}\n" + "\n".join(imports) + "\n```\n")
+
+        if e.get("docstring"):
+            lines.append(f"> {e['docstring'].strip()}\n")
+
+        if e.get("source"):
+            lines.append(f"### Definition\n```{fence}\n{e['source'].rstrip()}\n```\n")
+
+        if e.get("callers"):
+            lines.append("### Callers\n" + "\n".join(f"- `{c}`" for c in e["callers"]) + "\n")
+
+        lines.append("---\n")
+
+    return "\n".join(lines)
+
+
 def get_context_bundle(
     repo: str,
     symbol_id: Optional[str] = None,
     symbol_ids: Optional[list] = None,
     include_callers: bool = False,
+    output_format: str = "json",
     storage_path: Optional[str] = None,
 ) -> dict:
     """Get a context bundle: symbol definitions + imports from their files.
@@ -119,6 +146,9 @@ def get_context_bundle(
         Multi-symbol: ``symbols`` list + ``files`` import map.
     """
     start = time.perf_counter()
+
+    if output_format not in ("json", "markdown"):
+        return {"error": f"Invalid output_format '{output_format}'. Must be 'json' or 'markdown'."}
 
     # Normalise inputs
     if symbol_ids is not None:
@@ -212,6 +242,13 @@ def get_context_bundle(
         **_cost_avoided(tokens_saved, total_saved),
     }
 
+    repo_id = f"{owner}/{name}"
+
+    # ── Markdown output (single or multi) ─────────────────────────────────────
+    if output_format == "markdown":
+        md = _to_markdown(repo_id, symbol_entries, file_imports_cache)
+        return {"markdown": md, "_meta": _make_meta(elapsed, **meta_kwargs)}
+
     # ── Single-symbol: preserve original flat response shape ──────────────────
     if not multi:
         e = symbol_entries[0]
@@ -238,7 +275,7 @@ def get_context_bundle(
         files_map[sym_file] = {"imports": imports}
 
     return {
-        "repo": f"{owner}/{name}",
+        "repo": repo_id,
         "symbol_count": len(symbol_entries),
         "symbols": symbol_entries,
         "files": files_map,

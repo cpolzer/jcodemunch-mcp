@@ -30,6 +30,10 @@ from .tools.find_references import find_references
 from .tools.get_session_stats import get_session_stats
 from .tools.get_dependency_graph import get_dependency_graph
 from .tools.get_blast_radius import get_blast_radius
+from .tools.get_symbol_diff import get_symbol_diff
+from .tools.get_class_hierarchy import get_class_hierarchy
+from .tools.get_related_symbols import get_related_symbols
+from .tools.suggest_queries import suggest_queries
 from .tools.search_columns import search_columns
 from .tools.get_context_bundle import get_context_bundle
 from .parser.symbols import VALID_KINDS
@@ -433,6 +437,12 @@ async def list_tools() -> list[Tool]:
                         "type": "boolean",
                         "description": "When true, each symbol entry includes a 'callers' list of files that directly import its defining file.",
                         "default": False
+                    },
+                    "output_format": {
+                        "type": "string",
+                        "description": "'json' (default) or 'markdown' — markdown renders a paste-ready document with imports, docstrings, and source blocks.",
+                        "enum": ["json", "markdown"],
+                        "default": "json"
                     }
                 },
                 "required": ["repo"]
@@ -474,6 +484,54 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["repo", "file"]
             }
+        ),
+        Tool(
+            name="get_symbol_diff",
+            description="Diff the symbol sets of two indexed repositories (or two branches indexed separately). Shows added, removed, and changed symbols using content_hash for change detection. Index the same repo under two names to compare branches.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_a": {"type": "string", "description": "First repo identifier (the 'before' snapshot)"},
+                    "repo_b": {"type": "string", "description": "Second repo identifier (the 'after' snapshot)"},
+                },
+                "required": ["repo_a", "repo_b"],
+            },
+        ),
+        Tool(
+            name="get_class_hierarchy",
+            description="Get the full inheritance hierarchy for a class: ancestors (base classes via extends/implements) and descendants (subclasses/implementors). Works across Python, Java, TypeScript, C#, and any language where class signatures contain 'extends' or 'implements'.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository identifier (owner/repo or just repo name)"},
+                    "class_name": {"type": "string", "description": "Name of the class to analyse"},
+                },
+                "required": ["repo", "class_name"],
+            },
+        ),
+        Tool(
+            name="get_related_symbols",
+            description="Find symbols related to a given symbol using heuristic clustering: same-file co-location (weight 3), shared importers (weight 1.5), and name-token overlap (weight 0.5/token). Useful for discovering what else to read when exploring an unfamiliar codebase.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository identifier (owner/repo or just repo name)"},
+                    "symbol_id": {"type": "string", "description": "ID of the symbol to find relatives for"},
+                    "max_results": {"type": "integer", "description": "Maximum results (default 10, max 50)", "default": 10},
+                },
+                "required": ["repo", "symbol_id"],
+            },
+        ),
+        Tool(
+            name="suggest_queries",
+            description="Scan the index and suggest useful search queries, key entry-point files, and index statistics. Great first call when starting to explore an unfamiliar repository — surfaces the most-imported files, top keywords, kind/language distribution, and ready-to-run example queries.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository identifier (owner/repo or just repo name)"},
+                },
+                "required": ["repo"],
+            },
         ),
         Tool(
             name="get_blast_radius",
@@ -683,6 +741,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     symbol_id=arguments.get("symbol_id"),
                     symbol_ids=arguments.get("symbol_ids"),
                     include_callers=arguments.get("include_callers", False),
+                    output_format=arguments.get("output_format", "json"),
                     storage_path=storage_path,
                 )
             )
@@ -711,6 +770,42 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     repo=arguments["repo"],
                     symbol=arguments["symbol"],
                     depth=arguments.get("depth", 1),
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "get_symbol_diff":
+            result = await asyncio.to_thread(
+                functools.partial(
+                    get_symbol_diff,
+                    repo_a=arguments["repo_a"],
+                    repo_b=arguments["repo_b"],
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "get_class_hierarchy":
+            result = await asyncio.to_thread(
+                functools.partial(
+                    get_class_hierarchy,
+                    repo=arguments["repo"],
+                    class_name=arguments["class_name"],
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "get_related_symbols":
+            result = await asyncio.to_thread(
+                functools.partial(
+                    get_related_symbols,
+                    repo=arguments["repo"],
+                    symbol_id=arguments["symbol_id"],
+                    max_results=arguments.get("max_results", 10),
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "suggest_queries":
+            result = await asyncio.to_thread(
+                functools.partial(
+                    suggest_queries,
+                    repo=arguments["repo"],
                     storage_path=storage_path,
                 )
             )

@@ -7,6 +7,7 @@ import time
 from typing import Optional
 
 from ..storage import IndexStore, CodeIndex, record_savings, estimate_savings, cost_avoided
+from ..parser.imports import resolve_specifier
 from ._utils import resolve_repo
 
 BYTES_PER_TOKEN = 4
@@ -17,6 +18,9 @@ _BM25_B = 0.75
 
 # Per-field repetition weights: name appears 3× in the virtual doc, etc.
 _FIELD_REPS = {"name": 3, "keywords": 2, "signature": 2, "summary": 1, "docstring": 1}
+
+# Centrality: log-scaled bonus for symbols in frequently-imported files (tiebreaker only)
+_CENTRALITY_WEIGHT = 0.3
 
 
 def _tokenize(text: str) -> list[str]:
@@ -56,7 +60,22 @@ def _compute_bm25(symbols: list[dict]) -> tuple[dict[str, float], float]:
     return idf, avgdl
 
 
-def _bm25_score(sym: dict, query_terms: list[str], idf: dict[str, float], avgdl: float) -> float:
+def _compute_centrality(symbols: list[dict], imports: Optional[dict]) -> dict[str, float]:
+    """Return {file: log-scaled centrality bonus} based on importer count."""
+    if not imports:
+        return {}
+    source_files = frozenset(s["file"] for s in symbols)
+    counts: dict[str, int] = {}
+    for src_file, file_imports in imports.items():
+        for imp in file_imports:
+            target = resolve_specifier(imp["specifier"], src_file, source_files)
+            if target:
+                counts[target] = counts.get(target, 0) + 1
+    return {f: math.log(1 + c) * _CENTRALITY_WEIGHT for f, c in counts.items()}
+
+
+def _bm25_score(sym: dict, query_terms: list[str], idf: dict[str, float], avgdl: float,
+                centrality: Optional[dict] = None) -> float:
     """BM25 score for a single symbol."""
     tokens = _sym_tokens(sym)
     dl = len(tokens)
@@ -78,6 +97,9 @@ def _bm25_score(sym: dict, query_terms: list[str], idf: dict[str, float], avgdl:
         if tf == 0:
             continue
         score += idf_val * (tf * (_BM25_K1 + 1)) / (tf + K)
+
+    if centrality:
+        score += centrality.get(sym.get("file", ""), 0.0)
 
     return score
 
@@ -165,14 +187,15 @@ def search_symbols(
     if language:
         results = [s for s in results if s.get("language") == language]
 
-    # BM25 scoring
+    # BM25 scoring + centrality
     query_terms = _tokenize(query) or [query.lower()]
     idf, avgdl = _compute_bm25(index.symbols)
+    centrality = _compute_centrality(index.symbols, index.imports)
 
     candidates_scored = len(results)
     scored_results = []
     for sym in results:
-        score = _bm25_score(sym, query_terms, idf, avgdl)
+        score = _bm25_score(sym, query_terms, idf, avgdl, centrality)
         if detail_level == "compact":
             entry = {
                 "id": sym["id"],

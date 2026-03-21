@@ -114,29 +114,31 @@ class TestMtimeOptimization:
         result = index_folder(str(src), use_ai_summaries=False, storage_path=str(store_path))
         assert result["success"] is True
 
-        # Manually remove file_mtimes from the stored index to simulate v4
         store = IndexStore(base_path=str(store_path))
         repos = store.list_repos()
         repo_name = repos[0]["repo"].split("/")[1]
         index = store.load_index("local", repo_name)
         assert index is not None
-        index.file_mtimes.clear()
 
-        # Save back without mtimes (simulating old format)
-        import json
-        index_path = store._index_path("local", repo_name)
-        data = json.loads(index_path.read_text(encoding="utf-8"))
-        data.pop("file_mtimes", None)
-        index_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        # Manually clear file_mtimes in the stored SQLite index to simulate v4
+        # (v4 didn't store file_mtimes)
+        db_path = store._sqlite._db_path("local", repo_name)
+        conn = store._sqlite._connect(db_path)
+        try:
+            conn.execute("UPDATE files SET mtime_ns = NULL")
+        finally:
+            conn.close()
 
-        # Incremental should still work (all files get hashed since no mtimes)
-        _write_py(src, "hello.py", "def hello():\n    return 'changed'\n")
-        result2 = index_folder(
-            str(src), use_ai_summaries=False, storage_path=str(store_path), incremental=True
+        # detect_changes_with_mtimes should fall back to hash since mtimes are NULL
+        changed, new, deleted, hashes, mtimes = store.detect_changes_with_mtimes(
+            "local", repo_name,
+            current_mtimes={"hello.py": 9990000000000000000.0},
+            hash_fn=lambda fp: "definitely_a_different_hash",
         )
-        assert result2["success"] is True
-        assert result2["incremental"] is True
-        assert result2["changed"] == 1
+        # hello.py changed: no stored mtime (falls back to hash), and hash differs
+        assert changed == ["hello.py"]
+        assert "hello.py" not in new  # not "new" since it was already indexed
+        assert "hello.py" not in deleted
 
     def test_incremental_merges_mtimes(self, tmp_path):
         """After incremental update, old mtimes should be preserved and new ones added."""

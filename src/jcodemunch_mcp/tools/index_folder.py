@@ -97,6 +97,21 @@ def _is_gitignored(file_path: Path, gitignore_specs: dict[Path, pathspec.PathSpe
     return False
 
 
+def _is_gitignored_fast(resolved_str: str, specs: list[tuple[str, "pathspec.PathSpec"]]) -> bool:
+    """String-based gitignore check — avoids Path.relative_to() overhead.
+
+    Same semantics as _is_gitignored but uses string prefix matching instead
+    of Path operations (~10x faster in the inner loop).
+    """
+    for dir_prefix, spec in specs:
+        if not resolved_str.startswith(dir_prefix):
+            continue
+        rel = resolved_str[len(dir_prefix):].replace("\\", "/")
+        if spec.match_file(rel):
+            return True
+    return False
+
+
 def _local_repo_name(folder_path: Path) -> str:
     """Stable local repo id derived from basename + resolved path hash."""
     digest = hashlib.sha1(str(folder_path).encode("utf-8")).hexdigest()[:8]
@@ -155,6 +170,16 @@ def discover_local_files(
     # Load all .gitignore files in the tree (root + all subdirectories)
     gitignore_specs = _load_all_gitignores(root)
 
+    # Pre-compute string-based gitignore specs for the hot loop (avoids
+    # Path.relative_to() + exception handling per file per spec).
+    gitignore_str_specs: list[tuple[str, pathspec.PathSpec]] = [
+        (str(d) + os.sep, spec) for d, spec in gitignore_specs.items()
+    ] if gitignore_specs else []
+
+    # Pre-compute root path strings (root is already resolved above)
+    root_str = str(root)
+    root_prefix = root_str + os.sep
+
     # Merge env-var global patterns with per-call patterns, then build spec
     effective_extra = get_extra_ignore_patterns(extra_ignore_patterns)
     extra_spec = None
@@ -176,22 +201,30 @@ def discover_local_files(
             warnings.append(f"Skipped symlink escape: {file_path}")
             continue
 
-        # Path traversal check
-        if not validate_path(root, file_path):
+        # Resolve once per file — reused for traversal check, relative path,
+        # and gitignore matching (was resolved 2-3x before this optimization).
+        try:
+            resolved = file_path.resolve()
+        except OSError:
+            skip_counts["unreadable"] += 1
+            logger.debug("SKIP unreadable (resolve failed): %s", file_path)
+            continue
+        resolved_str = str(resolved)
+
+        # Path traversal check (same logic as validate_path but avoids
+        # re-resolving root on every iteration)
+        if not (resolved_str == root_str or resolved_str.startswith(root_prefix)):
             skip_counts["path_traversal"] += 1
             warnings.append(f"Skipped path traversal: {file_path}")
             continue
 
-        # Get relative path for pattern matching
-        try:
-            rel_path = file_path.relative_to(root).as_posix()
-        except ValueError:
-            skip_counts["path_traversal"] += 1
-            logger.debug("SKIP relative_to_failed: %s", file_path)
+        # Get relative path via string slicing (avoids Path.relative_to)
+        rel_path = resolved_str[len(root_prefix):].replace("\\", "/") if resolved_str != root_str else ""
+        if not rel_path:
             continue
 
-        # .gitignore matching (root + all nested .gitignore files)
-        if gitignore_specs and _is_gitignored(file_path.resolve(), gitignore_specs):
+        # .gitignore matching (string-based, avoids Path.relative_to per spec)
+        if gitignore_str_specs and _is_gitignored_fast(resolved_str, gitignore_str_specs):
             skip_counts["gitignore"] += 1
             logger.debug("SKIP gitignore: %s", rel_path)
             continue
@@ -373,7 +406,7 @@ def index_folder(
         # Discovery pass — resolve rel_paths and collect mtimes without
         # reading file contents (P2-5: avoids 200MB-1GB allocation
         # for large projects). Content is read on-demand later.
-        file_mtimes: dict[str, float] = {}
+        file_mtimes: dict[str, int] = {}
         rel_path_map: dict[str, Path] = {}  # rel_path -> absolute Path
         for file_path in source_files:
             if not validate_path(folder_path, file_path):

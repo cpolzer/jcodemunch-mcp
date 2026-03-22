@@ -25,12 +25,14 @@ import signal
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 _SAVINGS_FILE = "_savings.json"
+_SESSION_STATS_FILE = "session_stats.json"
 _BYTES_PER_TOKEN = 4  # ~4 bytes per token (rough but consistent)
 _TELEMETRY_URL = "https://j.gravelle.us/APIs/savings/post.php"
 _FLUSH_INTERVAL = 3  # flush to disk every N calls
@@ -104,14 +106,29 @@ class _State:
         """Return session-level stats (process lifetime)."""
         with self._lock:
             self._ensure_loaded(base_path)
-            elapsed = time.monotonic() - self._session_start
-            return {
-                "session_tokens_saved": self._session_tokens,
-                "session_calls": self._session_calls,
-                "session_duration_s": round(elapsed, 1),
-                "total_tokens_saved": self._total,
-                "tool_breakdown": dict(self._session_tool_breakdown),
-            }
+            stats = self._build_stats_locked()
+            self._write_session_stats_locked(stats)
+            return stats
+
+    def _build_stats_locked(self) -> dict:
+        """Build session stats dict. Must be called with _lock held."""
+        elapsed = time.monotonic() - self._session_start
+        return {
+            "session_tokens_saved": self._session_tokens,
+            "session_calls": self._session_calls,
+            "session_duration_s": round(elapsed, 1),
+            "total_tokens_saved": self._total,
+            "tool_breakdown": dict(self._session_tool_breakdown),
+        }
+
+    def _write_session_stats_locked(self, stats: dict) -> None:
+        """Write session stats to ~/.code-index/session_stats.json. Must be called with _lock held."""
+        path = _session_stats_path(self._base_path)
+        try:
+            payload = {**stats, "last_updated": datetime.now(timezone.utc).isoformat()}
+            path.write_text(json.dumps(payload, indent=2))
+        except Exception:
+            logger.debug("Failed to write session stats to %s", path, exc_info=True)
 
     def get_total(self, base_path: Optional[str]) -> int:
         with self._lock:
@@ -148,6 +165,7 @@ class _State:
 
         self._unflushed = 0
         self._call_count = 0
+        self._write_session_stats_locked(self._build_stats_locked())
 
     def flush(self) -> None:
         """Public flush — called at atexit."""
@@ -188,6 +206,12 @@ def _savings_path(base_path: Optional[str] = None) -> Path:
     root = Path(base_path) if base_path else Path.home() / ".code-index"
     root.mkdir(parents=True, exist_ok=True)
     return root / _SAVINGS_FILE
+
+
+def _session_stats_path(base_path: Optional[str] = None) -> Path:
+    root = Path(base_path) if base_path else Path.home() / ".code-index"
+    root.mkdir(parents=True, exist_ok=True)
+    return root / _SESSION_STATS_FILE
 
 
 def _share_savings(delta: int, anon_id: str) -> None:

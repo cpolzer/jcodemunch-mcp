@@ -77,14 +77,6 @@ def remap(path: str, pairs: list[tuple[str, str]], reverse: bool = False) -> str
     to the original input must account for this.
     """
 
-def remap_symbol_paths(symbol: dict, pairs: list[tuple[str, str]]) -> dict:
-    """Return a copy of symbol with all path fields forward-remapped.
-
-    Remaps the 'file' key (and 'source_root' if present).
-    Safe to call with an empty pairs list (normalises separators only).
-    Used by get_symbol, search_symbols, and other tools that return
-    symbol dicts directly.
-    """
 ```
 
 ### Separator normalisation detail
@@ -102,13 +94,15 @@ Output is reconstructed by replacing `/` with `os.sep`, so Windows users see
 > **Remap whenever a path is read from the stored index and returned to the caller.
 > Do not remap paths that come from user input.**
 
-| File | Location | Direction | Reason |
-|---|---|---|---|
-| `tools/index_folder.py:446` | watcher fast path, before `_local_repo_name` | reverse | match stored hash |
-| `tools/index_folder.py:698` | standard path, before `_local_repo_name` | reverse | match stored hash |
-| `storage/sqlite_store.py:853` | `_list_repo_from_db`, `source_root` field | forward | from stored index |
-| `storage/index_store.py:641` | `_repo_entry_from_data`, `source_root` field (legacy JSON) | forward | from stored index |
-| `server.py:~1432` | `_run_config` Core section | — | config display |
+| File | Location | Direction | Pattern | Reason |
+|---|---|---|---|---|
+| `tools/index_folder.py:446` | watcher fast path, before `_local_repo_name` | reverse | `Path(remap(str(folder_path), pairs, reverse=True))` | match stored hash |
+| `tools/index_folder.py:698` | standard path, before `_local_repo_name` | reverse | `Path(remap(str(folder_path), pairs, reverse=True))` | match stored hash |
+| `watcher.py:272` | `_watch_single`, before `_local_repo_id` | reverse | `remap(folder_path, pairs, reverse=True)` (`str` in, `str` out) | match stored hash |
+| `watcher.py:748` | cleanup branch, before `_local_repo_id` | reverse | `remap(folder, pairs, reverse=True)` | match stored hash |
+| `storage/sqlite_store.py:853` | `_list_repo_from_db`, `source_root` field | forward | `remap(meta.get("source_root", ""), pairs)` | from stored index |
+| `storage/index_store.py:641` | `_repo_entry_from_data`, `source_root` field (legacy JSON) | forward | `remap(data["source_root"], pairs)` | from stored index |
+| `server.py:~1432` | `_run_config` Core section | — | `os.environ.get(ENV_VAR, "")` — no `remap` call | config display |
 
 **Not remapped (confirmed):**
 
@@ -116,6 +110,7 @@ Output is reconstructed by replacing `/` with `os.sep`, so Windows users see
 - `find_references`, `find_importers`, `check_references` — import graph keys are relative paths (e.g. `src/main.py`), not absolute.
 - `get_repo_outline` — does not include `source_root` in its response payload.
 - `_index_to_dict` — internal serialisation helper, never returned to an MCP caller.
+- Symbol `file` fields in all tools (`get_symbol`, `search_symbols`, `find_importers`, etc.) — these are **relative paths** within the project, not absolute. No remap needed.
 
 ### Remap call pattern (forward, e.g. `_list_repo_from_db`)
 
@@ -176,11 +171,6 @@ Modelled on `tests/test_extra_extensions.py` (monkeypatch + autouse fixture styl
 - First matching pair wins (pair order matters)
 - Mixed separators in input (`D:/Nextcloud/Dev`) match prefix `D:\Nextcloud`
 
-### `remap_symbol_paths` cases
-- Symbol with only `file` key → `file` remapped
-- Symbol with `file` and `source_root` → both remapped
-- Empty pairs → separators normalised, values otherwise unchanged
-
 ### Integration: `list_repos` with remap
 - Index a temp folder, set `JCODEMUNCH_PATH_MAP` to remap that path, call `list_repos`,
   verify `source_root` in the response contains the remapped prefix.
@@ -207,8 +197,9 @@ Modelled on `tests/test_extra_extensions.py` (monkeypatch + autouse fixture styl
 
 | File | Change |
 |---|---|
-| `src/jcodemunch_mcp/path_map.py` | **new** — `ENV_VAR`, `parse_path_map`, `remap`, `remap_symbol_paths` |
+| `src/jcodemunch_mcp/path_map.py` | **new** — `ENV_VAR`, `parse_path_map`, `remap` |
 | `src/jcodemunch_mcp/tools/index_folder.py` | reverse remap at lines 446 and 698 |
+| `src/jcodemunch_mcp/watcher.py` | reverse remap at lines 272 and 748 |
 | `src/jcodemunch_mcp/storage/sqlite_store.py` | forward remap at line 853 |
 | `src/jcodemunch_mcp/storage/index_store.py` | forward remap at line 641 |
 | `src/jcodemunch_mcp/server.py` | add `JCODEMUNCH_PATH_MAP` to `_run_config` Core section |

@@ -788,30 +788,24 @@ async def watch_claude_worktrees(
     # --- Manifest watcher task ---
 
     async def _manifest_watcher() -> None:
-        """Watch the JSONL manifest for new lines and react to create/remove events."""
+        """Poll the JSONL manifest for new lines and react to create/remove events."""
         # Track file position to only read new lines
-        if manifest_path.is_file():
-            last_size = manifest_path.stat().st_size
-        else:
-            last_size = 0
+        last_size = manifest_path.stat().st_size if manifest_path.is_file() else 0
 
-        from watchfiles import awatch  # noqa: PLC0415 — lazy import (optional dep)
-        async for _changes in awatch(
-            str(manifest_path.parent),
-            debounce=500,
-            recursive=False,
-            step=100,
-        ):
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=0.5)
+                return  # stop requested
+            except asyncio.TimeoutError:
+                pass
+
             if not manifest_path.is_file():
                 continue
             current_size = manifest_path.stat().st_size
             if current_size <= last_size:
-                last_size = current_size
                 continue
 
             # Read only new lines
-            import json as _json
-
             with open(manifest_path) as f:
                 f.seek(last_size)
                 new_lines = f.read()
@@ -819,8 +813,8 @@ async def watch_claude_worktrees(
 
             for line in new_lines.strip().splitlines():
                 try:
-                    entry = _json.loads(line)
-                except _json.JSONDecodeError:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
                     continue
                 path = entry.get("path")
                 event = entry.get("event")

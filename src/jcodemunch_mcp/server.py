@@ -40,6 +40,7 @@ from .tools.get_symbol_diff import get_symbol_diff
 from .tools.get_class_hierarchy import get_class_hierarchy
 from .tools.get_related_symbols import get_related_symbols
 from .tools.get_symbol_importance import get_symbol_importance
+from .tools.find_dead_code import find_dead_code
 from .tools.suggest_queries import suggest_queries
 from .tools.search_columns import search_columns
 from .tools.get_context_bundle import get_context_bundle
@@ -812,6 +813,43 @@ async def list_tools() -> list[Tool]:
                 "required": ["repo"],
             },
         ),
+        Tool(
+            name="find_dead_code",
+            description=(
+                "Find dead code — files and symbols with zero importers and no entry-point role. "
+                "Uses the import graph to identify unreachable code. Returns confidence scores "
+                "(1.0 = provably unreachable, 0.7 = all importers are themselves dead). "
+                "Set granularity='file' for file-level results only."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository identifier (owner/repo or just repo name)"},
+                    "granularity": {
+                        "type": "string",
+                        "enum": ["symbol", "file"],
+                        "description": "'symbol' (default) returns dead symbols; 'file' returns dead files only.",
+                        "default": "symbol",
+                    },
+                    "min_confidence": {
+                        "type": "number",
+                        "description": "Minimum confidence threshold 0.0–1.0. Default 0.8. Use 1.0 for provably unreachable only.",
+                        "default": 0.8,
+                    },
+                    "include_tests": {
+                        "type": "boolean",
+                        "description": "Treat test files as live roots (default false — test files are excluded from dead code candidates).",
+                        "default": False,
+                    },
+                    "entry_point_patterns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Additional glob patterns to treat as live roots (e.g. 'cli/*.py', 'scripts/*').",
+                    },
+                },
+                "required": ["repo"],
+            },
+        ),
     ]
     # Filter out disabled tools
     disabled = config_module.get("disabled_tools", [])
@@ -1202,6 +1240,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     top_n=arguments.get("top_n", 20),
                     algorithm=arguments.get("algorithm", "pagerank"),
                     scope=arguments.get("scope"),
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "find_dead_code":
+            result = await asyncio.to_thread(
+                functools.partial(
+                    find_dead_code,
+                    repo=arguments["repo"],
+                    granularity=arguments.get("granularity", "symbol"),
+                    min_confidence=arguments.get("min_confidence", 0.8),
+                    include_tests=arguments.get("include_tests", False),
+                    entry_point_patterns=arguments.get("entry_point_patterns"),
                     storage_path=storage_path,
                 )
             )

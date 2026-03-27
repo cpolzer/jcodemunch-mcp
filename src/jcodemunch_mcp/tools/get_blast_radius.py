@@ -24,11 +24,14 @@ def _build_reverse_adjacency(
     return {k: list(dict.fromkeys(v)) for k, v in rev.items()}
 
 
-def _bfs_importers(start: str, rev: dict[str, list[str]], depth: int) -> list[str]:
-    """BFS over reverse graph; return all reachable files (excluding start)."""
+def _bfs_importers(
+    start: str, rev: dict[str, list[str]], depth: int
+) -> tuple[list[str], dict[int, list[str]]]:
+    """BFS over reverse graph; return (flat list, depth-bucketed dict) excluding start."""
     visited: set[str] = {start}
     queue: deque = deque([(start, 0)])
     result: list[str] = []
+    by_depth: dict[int, list[str]] = {}
     while queue:
         node, level = queue.popleft()
         if level >= depth:
@@ -36,9 +39,11 @@ def _bfs_importers(start: str, rev: dict[str, list[str]], depth: int) -> list[st
         for importer in rev.get(node, []):
             if importer not in visited:
                 visited.add(importer)
+                d = level + 1
                 result.append(importer)
-                queue.append((importer, level + 1))
-    return result
+                by_depth.setdefault(d, []).append(importer)
+                queue.append((importer, d))
+    return result, by_depth
 
 
 def _find_symbol(index, symbol: str) -> list[dict]:
@@ -65,6 +70,7 @@ def get_blast_radius(
     repo: str,
     symbol: str,
     depth: int = 1,
+    include_depth_scores: bool = False,
     storage_path: Optional[str] = None,
 ) -> dict:
     """Find all files that would be affected if a symbol's signature or behaviour changed.
@@ -131,7 +137,7 @@ def get_blast_radius(
     rev = _build_reverse_adjacency(index.imports, source_files, index.alias_map)
 
     # BFS to collect all importing files
-    importer_files = _bfs_importers(sym_file, rev, depth)
+    importer_files, files_by_depth = _bfs_importers(sym_file, rev, depth)
 
     # Text-scan each importer for the symbol name
     confirmed: list[dict] = []
@@ -152,8 +158,19 @@ def get_blast_radius(
     confirmed.sort(key=lambda x: x["file"])
     potential.sort(key=lambda x: x["file"])
 
+    # Risk scoring (always computed, cheap)
+    total = len(importer_files)
+    direct_count = len(files_by_depth.get(1, []))
+    if total > 0:
+        overall_risk = sum(
+            (1.0 / (d ** 0.7)) * len(files)
+            for d, files in files_by_depth.items()
+        ) / total
+    else:
+        overall_risk = 0.0
+
     elapsed = (time.perf_counter() - start) * 1000
-    return {
+    result = {
         "repo": f"{owner}/{name}",
         "symbol": {
             "name": sym_name,
@@ -163,7 +180,9 @@ def get_blast_radius(
             "id": sym.get("id", ""),
         },
         "depth": depth,
-        "importer_count": len(importer_files),
+        "importer_count": total,
+        "direct_dependents_count": direct_count,
+        "overall_risk_score": round(overall_risk, 4),
         "confirmed_count": len(confirmed),
         "potential_count": len(potential),
         "confirmed": confirmed,
@@ -176,3 +195,13 @@ def get_blast_radius(
             ),
         },
     }
+    if include_depth_scores:
+        result["impact_by_depth"] = [
+            {
+                "depth": d,
+                "files": sorted(files_by_depth[d]),
+                "risk_score": round(1.0 / (d ** 0.7), 4),
+            }
+            for d in sorted(files_by_depth)
+        ]
+    return result

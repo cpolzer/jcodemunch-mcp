@@ -4,6 +4,16 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ## [Unreleased]
 
+## [1.11.14] - 2026-03-27
+
+### Added
+- **`find_dead_code` tool** — finds files and symbols unreachable from any entry point using the import graph. Entry points auto-detected by filename (`main.py`, `__main__.py`, `conftest.py`, `manage.py`, etc.), `__init__.py` package roots, and `if __name__ == "__main__"` guards (Python only). Returns `dead_files` and `dead_symbols` with confidence scores: `1.0` = zero importers, no framework decoration; `0.9` = zero importers in a test file; `0.7` = all importers are themselves dead (cascading). Parameters: `granularity` ("symbol"/"file"), `min_confidence` (default 0.8), `include_tests` (bool), `entry_point_patterns` (additional glob roots). No new dependencies. 13 new tests.
+
+## [1.11.13] - 2026-03-27
+
+### Fixed
+- **Manifest watcher reliability** — replaced `watchfiles.awatch()` in `_manifest_watcher` with a simple 0.5s polling loop. `watchfiles` was unreliable on Windows (especially in temp directories used by tests and agent hooks), causing the manifest watcher to silently miss create/remove events. Polling the manifest file's size every 500ms is sufficient for this append-only JSONL file and works reliably on all platforms.
+
 ## [1.11.12] - 2026-03-27
 
 ### Added

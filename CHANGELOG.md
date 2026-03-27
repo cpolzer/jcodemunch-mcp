@@ -4,6 +4,20 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ## [Unreleased]
 
+## [1.11.17] - 2026-03-27
+
+### Added
+- **Optional semantic / embedding search (Feature 8)** — hybrid BM25 + vector search, opt-in only, zero mandatory new dependencies.
+  - `search_symbols` gains three new params: `semantic` (bool, default `false`), `semantic_weight` (float 0–1, default 0.5), `semantic_only` (bool, default `false`). When `semantic=false` (default) there is zero performance impact and zero new imports.
+  - **New `embed_repo` tool** — precomputes and caches all symbol embeddings in one pass (`batch_size`, `force` params). Optional warm-up; `search_symbols` lazily embeds missing symbols on first semantic query.
+  - **New `EmbeddingStore`** — thin SQLite CRUD layer (`symbol_embeddings` table) in the existing per-repo `.db` file. Embeddings serialised as float32 BLOBs via stdlib `array` module. Persists across restarts; invalidatable per-symbol for incremental reindex.
+  - **Three embedding providers** (priority order): local `sentence-transformers` (`JCODEMUNCH_EMBED_MODEL` env var), Gemini (`GOOGLE_API_KEY` + `GOOGLE_EMBED_MODEL`), OpenAI (`OPENAI_API_KEY` + `OPENAI_EMBED_MODEL`). `OPENAI_API_KEY` alone does **not** activate embeddings (prevents conflation with local-LLM summariser use).
+  - **Hybrid ranking**: `combined = (1−w) × bm25_normalised + w × cosine_similarity`. BM25 normalised by max score over the candidate set. `semantic_weight=0.0` produces identical results to pure BM25.
+  - **Pure Python cosine similarity** — `math.sqrt` + `sum()`, no numpy required.
+  - `semantic=true` with no provider configured returns `{"error": "no_embedding_provider", "message": "..."}` (structured error, not a crash).
+  - New optional dep: `pip install jcodemunch-mcp[semantic]` installs `sentence-transformers>=2.2.0`.
+  - 22 new tests.
+
 ## [1.11.16] - 2026-03-27
 
 ### Added

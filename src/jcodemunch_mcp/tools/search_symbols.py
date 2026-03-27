@@ -201,6 +201,22 @@ def _edit_distance(a: str, b: str) -> int:
     return row[la]
 
 
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Cosine similarity in pure Python (no numpy).
+
+    Returns 0.0 if either vector is zero-length or the lists differ in size.
+    Uses ``math.sqrt`` and ``sum()`` — no external deps.
+    """
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
 def search_symbols(
     repo: str,
     query: str,
@@ -215,6 +231,9 @@ def search_symbols(
     fuzzy_threshold: float = 0.4,
     max_edit_distance: int = 2,
     sort_by: str = "relevance",
+    semantic: bool = False,
+    semantic_weight: float = 0.5,
+    semantic_only: bool = False,
     storage_path: Optional[str] = None
 ) -> dict:
     """Search for symbols matching a query.
@@ -242,6 +261,15 @@ def search_symbols(
         sort_by: Ranking strategy. "relevance" (default) = BM25 + centrality tiebreaker.
             "centrality" = filter by query match, rank by PageRank score.
             "combined" = BM25 + PageRank weighted combination.
+        semantic: Enable semantic (embedding-based) search. Requires an embedding
+            provider to be configured (JCODEMUNCH_EMBED_MODEL, GOOGLE_API_KEY +
+            GOOGLE_EMBED_MODEL, or OPENAI_API_KEY + OPENAI_EMBED_MODEL).
+            When False (default) there is zero performance impact and no new imports.
+        semantic_weight: Weight for semantic score in hybrid ranking (0.0–1.0).
+            BM25 receives ``1 - semantic_weight``. Default 0.5.
+            Set to 0.0 for pure BM25 behaviour; set to 1.0 for pure semantic.
+        semantic_only: Skip BM25 entirely; rank solely by embedding similarity.
+            Implies semantic=True.
         storage_path: Custom storage path.
 
     Returns:
@@ -272,6 +300,23 @@ def search_symbols(
     if not index:
         return {"error": f"Repository not indexed: {owner}/{name}"}
 
+    # Semantic: validate provider before doing any expensive work
+    _semantic_provider: Optional[tuple[str, str]] = None
+    if semantic or semantic_only:
+        semantic = True  # semantic_only implies semantic
+        from .embed_repo import _detect_provider
+        _semantic_provider = _detect_provider()
+        if _semantic_provider is None:
+            return {
+                "error": "no_embedding_provider",
+                "message": (
+                    "No embedding provider is configured. Set one of: "
+                    "JCODEMUNCH_EMBED_MODEL (sentence-transformers, free/local), "
+                    "GOOGLE_API_KEY + GOOGLE_EMBED_MODEL (Gemini), or "
+                    "OPENAI_API_KEY + OPENAI_EMBED_MODEL (OpenAI)."
+                ),
+            }
+
     # BM25 corpus stats — cached on CodeIndex, computed once per index load
     query_terms = _tokenize(query) or [query.lower()]
     cache = index._bm25_cache
@@ -294,6 +339,50 @@ def search_symbols(
             cache["pagerank"] = pr_scores
         pagerank = cache["pagerank"]
 
+    has_filters = bool(kind or file_pattern or language)
+
+    # Bound the heap size in both modes.
+    # token_budget mode: estimate ceiling as budget_bytes / min_symbol_size so the
+    # heap stays O(N log K) instead of O(N log N) on large indexes.
+    # A 20-byte floor is conservative — real symbols are rarely smaller.
+    _MIN_BYTES_PER_SYMBOL = 20
+    if token_budget is not None:
+        budget_bytes = token_budget * BYTES_PER_TOKEN
+        effective_limit = max(max_results, budget_bytes // _MIN_BYTES_PER_SYMBOL)
+    else:
+        budget_bytes = 0
+        effective_limit = max_results
+
+    # ── Semantic / hybrid search path ──────────────────────────────────────
+    # Diverges here when semantic=True; pure BM25 path continues below.
+    if semantic and _semantic_provider is not None:
+        return _search_symbols_semantic(
+            index=index,
+            store=store,
+            owner=owner,
+            name=name,
+            query=query,
+            query_terms=query_terms,
+            idf=idf,
+            avgdl=avgdl,
+            centrality=centrality,
+            has_filters=has_filters,
+            kind=kind,
+            file_pattern=file_pattern,
+            language=language,
+            max_results=max_results,
+            effective_limit=effective_limit,
+            token_budget=token_budget,
+            budget_bytes=budget_bytes,
+            detail_level=detail_level,
+            debug=debug,
+            semantic_weight=semantic_weight,
+            semantic_only=semantic_only,
+            provider=_semantic_provider[0],
+            model=_semantic_provider[1],
+            start=start,
+        )
+
     # Narrow candidates using inverted index: only score symbols that
     # contain at least one query term (union of posting lists).
     # Filters (kind/file_pattern/language) are applied AFTER narrowing.
@@ -308,19 +397,6 @@ def search_symbols(
         candidates = [index.symbols[i] for i in sorted(candidate_indices)]
     else:
         candidates = index.symbols
-
-    has_filters = bool(kind or file_pattern or language)
-
-    # Bound the heap size in both modes.
-    # token_budget mode: estimate ceiling as budget_bytes / min_symbol_size so the
-    # heap stays O(N log K) instead of O(N log N) on large indexes.
-    # A 20-byte floor is conservative — real symbols are rarely smaller.
-    _MIN_BYTES_PER_SYMBOL = 20
-    if token_budget is not None:
-        budget_bytes = token_budget * BYTES_PER_TOKEN
-        effective_limit = max(max_results, budget_bytes // _MIN_BYTES_PER_SYMBOL)
-    else:
-        effective_limit = max_results
     heap: list[tuple[float, int, dict]] = []  # (score, candidates_scored, entry)
     candidates_scored = 0
     max_bm25_score = 0.0
@@ -493,6 +569,199 @@ def search_symbols(
         meta["tokens_remaining"] = max(0, token_budget - used // BYTES_PER_TOKEN)
     if debug:
         meta["candidates_scored"] = candidates_scored
+    if scored_results:
+        meta["hint"] = "Use get_context_bundle(symbol_id) to retrieve source + imports in one call"
+
+    return {
+        "result_count": len(scored_results),
+        "results": scored_results,
+        "_meta": meta,
+    }
+
+
+def _search_symbols_semantic(
+    *,
+    index,
+    store,
+    owner: str,
+    name: str,
+    query: str,
+    query_terms: list[str],
+    idf: dict,
+    avgdl: float,
+    centrality: dict,
+    has_filters: bool,
+    kind: Optional[str],
+    file_pattern: Optional[str],
+    language: Optional[str],
+    max_results: int,
+    effective_limit: int,
+    token_budget: Optional[int],
+    budget_bytes: int,
+    detail_level: str,
+    debug: bool,
+    semantic_weight: float,
+    semantic_only: bool,
+    provider: str,
+    model: str,
+    start: float,
+) -> dict:
+    """Semantic / hybrid scoring path for search_symbols.
+
+    Two-pass algorithm:
+    1. Compute BM25 scores for all filtered symbols (for normalisation).
+    2. Compute cosine similarity against the query embedding for all symbols.
+    3. Combine: ``combined = (1-w)*bm25_norm + w*cosine``.
+
+    When ``semantic_only=True`` the BM25 component is skipped entirely (w=1).
+    When ``semantic_weight=0.0`` the result is identical to pure BM25.
+    """
+    from .embed_repo import embed_texts, _sym_text, EMBED_BATCH_SIZE
+    from ..storage.embedding_store import EmbeddingStore
+    import logging as _logging
+
+    _logger = _logging.getLogger(__name__)
+
+    # ── Get query embedding ────────────────────────────────────────────────
+    try:
+        query_vec = embed_texts([query], provider, model)[0]
+    except Exception as exc:
+        return {"error": f"Failed to embed query: {exc}"}
+
+    # ── Load / lazily compute symbol embeddings ────────────────────────────
+    db_path = store._sqlite._db_path(owner, name)
+    emb_store = EmbeddingStore(db_path)
+    all_emb: dict[str, list[float]] = emb_store.get_all()
+
+    missing = [s for s in index.symbols if s["id"] not in all_emb]
+    if missing:
+        new_emb: dict[str, list[float]] = {}
+        for bi in range(0, len(missing), EMBED_BATCH_SIZE):
+            batch = missing[bi : bi + EMBED_BATCH_SIZE]
+            try:
+                vecs = embed_texts([_sym_text(s) for s in batch], provider, model)
+                for j, sym in enumerate(batch):
+                    new_emb[sym["id"]] = vecs[j]
+            except Exception as exc:
+                _logger.warning("semantic: embedding batch %d failed: %s", bi // EMBED_BATCH_SIZE, exc)
+        if new_emb:
+            if emb_store.get_dimension() is None:
+                dim = len(next(iter(new_emb.values())))
+                emb_store.set_dimension(dim, model)
+            emb_store.set_many(new_emb)
+            all_emb.update(new_emb)
+
+    # ── Two-pass scoring ───────────────────────────────────────────────────
+    # Pass 1: collect BM25 + cosine for every filtered symbol
+    raw: list[tuple[dict, float, float]] = []  # (sym, bm25, cosine)
+    max_bm25 = 0.0
+
+    for sym in index.symbols:
+        if has_filters:
+            if kind and sym.get("kind") != kind:
+                continue
+            if file_pattern and not fnmatch(sym.get("file", ""), file_pattern):
+                continue
+            if language and sym.get("language") != language:
+                continue
+
+        bm25 = 0.0 if semantic_only else _bm25_score(sym, query_terms, idf, avgdl, centrality)
+        if bm25 > max_bm25:
+            max_bm25 = bm25
+
+        sym_vec = all_emb.get(sym["id"])
+        cos = _cosine_similarity(query_vec, sym_vec) if sym_vec else 0.0
+
+        raw.append((sym, bm25, cos))
+
+    # Pass 2: normalise BM25 and compute combined score
+    scored: list[tuple[float, dict]] = []
+    for sym, bm25, cos in raw:
+        bm25_norm = (bm25 / max_bm25) if max_bm25 > 0.0 else 0.0
+        score = cos if semantic_only else (1.0 - semantic_weight) * bm25_norm + semantic_weight * cos
+        if score <= 0.0:
+            continue
+        scored.append((score, sym))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[:effective_limit]
+
+    # ── Build result entries ───────────────────────────────────────────────
+    scored_results: list[dict] = []
+    for score, sym in top:
+        if detail_level == "compact":
+            entry: dict = {
+                "id": sym["id"],
+                "name": sym["name"],
+                "kind": sym["kind"],
+                "file": sym["file"],
+                "line": sym["line"],
+                "byte_length": sym.get("byte_length", 0),
+            }
+        else:
+            entry = {
+                "id": sym["id"],
+                "kind": sym["kind"],
+                "name": sym["name"],
+                "file": sym["file"],
+                "line": sym["line"],
+                "signature": sym["signature"],
+                "summary": sym.get("summary", ""),
+                "byte_length": sym.get("byte_length", 0),
+            }
+        if debug:
+            entry["score"] = round(score, 4)
+        scored_results.append(entry)
+
+    # ── Token budget packing ───────────────────────────────────────────────
+    if token_budget is not None:
+        packed: list[dict] = []
+        used = 0
+        for entry in scored_results:
+            b = entry["byte_length"]
+            if used + b <= budget_bytes:
+                packed.append(entry)
+                used += b
+        scored_results = packed
+
+    # ── Full detail: inline source + docstring ─────────────────────────────
+    if detail_level == "full":
+        for entry in scored_results:
+            sym_raw = index._get_symbol_raw(entry["id"])
+            if sym_raw:
+                src = store.get_symbol_content(owner, name, entry["id"], _index=index)
+                entry["end_line"] = sym_raw.get("end_line", entry["line"])
+                entry["docstring"] = sym_raw.get("docstring", "")
+                entry["source"] = src or ""
+
+    # ── Meta ───────────────────────────────────────────────────────────────
+    raw_bytes = 0
+    seen_files: set = set()
+    response_bytes = 0
+    for entry in scored_results:
+        f = entry["file"]
+        if f not in seen_files:
+            seen_files.add(f)
+            raw_bytes += index.file_sizes.get(f, 0)
+        response_bytes += entry["byte_length"]
+    tokens_saved = estimate_savings(raw_bytes, response_bytes)
+    total_saved = record_savings(tokens_saved, tool_name="search_symbols")
+    elapsed = (time.perf_counter() - start) * 1000
+
+    meta: dict = {
+        "timing_ms": round(elapsed, 1),
+        "total_symbols": len(index.symbols),
+        "truncated": len(scored) > len(scored_results),
+        "tokens_saved": tokens_saved,
+        "total_tokens_saved": total_saved,
+        "search_mode": "semantic_only" if semantic_only else "hybrid",
+        **cost_avoided(tokens_saved, total_saved),
+    }
+    if token_budget is not None:
+        used_bytes = sum(e["byte_length"] for e in scored_results)
+        meta["token_budget"] = token_budget
+        meta["tokens_used"] = used_bytes // BYTES_PER_TOKEN
+        meta["tokens_remaining"] = max(0, token_budget - used_bytes // BYTES_PER_TOKEN)
     if scored_results:
         meta["hint"] = "Use get_context_bundle(symbol_id) to retrieve source + imports in one call"
 

@@ -46,6 +46,7 @@ from .tools.suggest_queries import suggest_queries
 from .tools.search_columns import search_columns
 from .tools.get_context_bundle import get_context_bundle
 from .tools.get_ranked_context import get_ranked_context
+from .tools.embed_repo import embed_repo
 from .parser.symbols import VALID_KINDS
 from .reindex_state import wait_for_fresh_result, get_reindex_status, await_freshness_if_strict
 from .path_map import ENV_VAR as _PATH_MAP_ENV_VAR
@@ -456,6 +457,21 @@ async def list_tools() -> list[Tool]:
                         "enum": ["relevance", "centrality", "combined"],
                         "description": "Ranking strategy. 'relevance' (default) = BM25 text match. 'centrality' = filter by query, rank by PageRank. 'combined' = BM25 + PageRank weighted.",
                         "default": "relevance"
+                    },
+                    "semantic": {
+                        "type": "boolean",
+                        "description": "Enable semantic (embedding-based) search. Requires an embedding provider: JCODEMUNCH_EMBED_MODEL (sentence-transformers), GOOGLE_API_KEY+GOOGLE_EMBED_MODEL (Gemini), or OPENAI_API_KEY+OPENAI_EMBED_MODEL (OpenAI). When false (default) there is zero performance impact.",
+                        "default": False
+                    },
+                    "semantic_weight": {
+                        "type": "number",
+                        "description": "Weight for semantic score in hybrid BM25+embedding ranking (0.0–1.0). BM25 receives 1-weight. Default 0.5. Set to 0.0 for identical results to pure BM25; set to 1.0 for pure semantic.",
+                        "default": 0.5
+                    },
+                    "semantic_only": {
+                        "type": "boolean",
+                        "description": "Skip BM25 entirely and rank solely by embedding cosine similarity. Implies semantic=true.",
+                        "default": False
                     }
                 },
                 "required": ["repo", "query"]
@@ -952,6 +968,37 @@ async def list_tools() -> list[Tool]:
                 "required": ["repo"],
             },
         ),
+        Tool(
+            name="embed_repo",
+            description=(
+                "Precompute and cache symbol embeddings for semantic search. "
+                "Optional warm-up: search_symbols with semantic=true lazily embeds missing "
+                "symbols on first use, but embed_repo warms the cache upfront so the first "
+                "semantic query returns immediately. "
+                "Requires an embedding provider (JCODEMUNCH_EMBED_MODEL, "
+                "GOOGLE_API_KEY+GOOGLE_EMBED_MODEL, or OPENAI_API_KEY+OPENAI_EMBED_MODEL)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Repository identifier (owner/repo or just repo name)",
+                    },
+                    "batch_size": {
+                        "type": "integer",
+                        "description": "Symbols per embedding batch (default 50).",
+                        "default": 50,
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Recompute all embeddings even if they already exist (default false).",
+                        "default": False,
+                    },
+                },
+                "required": ["repo"],
+            },
+        ),
     ]
     # Filter out disabled tools
     disabled = config_module.get("disabled_tools", [])
@@ -1165,6 +1212,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         fuzzy_threshold=arguments.get("fuzzy_threshold", 0.4),
                         max_edit_distance=arguments.get("max_edit_distance", 2),
                         sort_by=arguments.get("sort_by", "relevance"),
+                        semantic=arguments.get("semantic", False),
+                        semantic_weight=arguments.get("semantic_weight", 0.5),
+                        semantic_only=arguments.get("semantic_only", False),
                         storage_path=storage_path,
                     )
                 )
@@ -1382,6 +1432,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     until_sha=arguments.get("until_sha", "HEAD"),
                     include_blast_radius=arguments.get("include_blast_radius", False),
                     max_blast_depth=arguments.get("max_blast_depth", 3),
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "embed_repo":
+            result = await asyncio.to_thread(
+                functools.partial(
+                    embed_repo,
+                    repo=arguments["repo"],
+                    batch_size=arguments.get("batch_size", 50),
+                    force=arguments.get("force", False),
                     storage_path=storage_path,
                 )
             )
